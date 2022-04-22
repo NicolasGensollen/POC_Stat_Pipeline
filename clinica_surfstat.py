@@ -1,7 +1,12 @@
 
+import os
+from os import PathLike
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from string import Template
+from typing import Tuple, Dict
+import matplotlib.pyplot as plt
 
 
 DEFAULT_FWHM = 20
@@ -12,7 +17,7 @@ TSV_FIRST_COLUMN = "participant_id"
 TSV_SECOND_COLUMN = "session_id"
 
 
-def _extract_parameters(parameters: dict) -> Tuple[float, float, float, float]:
+def _extract_parameters(parameters: Dict) -> Tuple[float, float, float, float]:
     fwhm = DEFAULT_FWHM
     if "sizeoffwhm" in parameters:
         fwhm = parameters["sizeoffwhm "]
@@ -46,10 +51,9 @@ def _read_and_check_tsv_file(tsv_file: PathLike, strformat: str) -> pd.DataFrame
 
 
 def _get_t1_freesurfer_custom_file_template(base_dir):
-    from string import Template
     return Template(
         str(base_dir) +
-        "/${subject}/${session}/t1/freesurfer_cross_sectional/${@subject}_${session}/surf/${hemi}.thickness.fwhm${fwhm}.fsaverage.mgh"
+        "/${subject}/${session}/t1/freesurfer_cross_sectional/${subject}_${session}/surf/${hemi}.thickness.fwhm${fwhm}.fsaverage.mgh"
     )
 
 
@@ -98,8 +102,8 @@ def _check_contrast(contrast: str, df_subjects: pd.DataFrame) -> Tuple[str, bool
 
 
 def clinica_surfstat(
-    inputdir: PathLike,
-    outputdir: PathLike,
+    input_dir: PathLike,
+    output_dir: PathLike,
     tsv_file: PathLike,
     design_matrix: str,
     contrast: str,
@@ -118,33 +122,46 @@ def clinica_surfstat(
     glm_type : {"group_comparison", "correlation"}
         Type of GLM to run.
     """
+    from nilearn.surface import Mesh, load_surf_mesh
     fwhm, threshold_uncorrected_pvalue, threshold_corrected_pvalue, cluster_threshold = _extract_parameters(parameters)
-    fsaveragepath = freesurferhome / Path("/subjects/fsaverage/surf")
+    fsaverage_path = (freesurfer_home / Path("subjects/fsaverage/surf"))
+    print(f"fsaverage path : {fsaverage_path}")
     df_subjects = _read_and_check_tsv_file(tsv_file, strformat)
     n_subjects = len(df_subjects)
     absolute_contrast, with_interaction = _check_contrast(contrast, df_subjects)
     thickness = _build_thickness_array(input_dir, surface_file, df_subjects, fwhm)
     mask = thickness[0, :] > 0
-    from nilearn.surface import load_surf_mesh
     meshes = [
-        load_surf_mesh(fsaveragepath / Path(f"{hemi}.pial"))
+        load_surf_mesh(str(fsaverage_path / Path(f"{hemi}.pial")))
         for hemi in ['lh', 'rh']
     ]
     coordinates = np.vstack([mesh.coordinates for mesh in meshes])
     faces = np.vstack([mesh.faces for mesh in meshes])
+    ##################
+    ## UGLY HACK !!! Need investigation
+    ##################
+    faces += 1
+    #################
     average_surface = {
         "coord": coordinates,
         "tri": faces,
     }
+    print(f"Absolute contrast = {absolute_contrast}")
+    print(f"Mask shape = {mask.shape}")
+    group_values = np.unique(df_subjects[absolute_contrast])
+    contrast_g = (
+        (df_subjects[absolute_contrast] == group_values[0]).astype(int) -
+        (df_subjects[absolute_contrast] == group_values[1]).astype(int)
+    )
     if glm_type == "group_comparison":
-        print(f"The GLM linear model is: {designmatrix}")
+        print(f"The GLM linear model is: {design_matrix}")
         if not with_interaction:
             from brainstat.stats.terms import FixedEffect
             from brainstat.stats.SLM import SLM
             model = FixedEffect(df_subjects[absolute_contrast])
             slm_model = SLM(
                 model,
-                contrast=df_subjects[absolute_contrast],
+                contrast=contrast_g,
                 surf=average_surface,
                 mask=mask,
                 correction=["fdr", "rft"],
@@ -152,7 +169,31 @@ def clinica_surfstat(
             )
             slm_model.fit(thickness)
             print("T-values :")
-            print(slm.t)
+            print(slm_model.t)
+            from nilearn.plotting import plot_surf_stat_map
+            output_filename = f"group-{group_label}_{group_values[0]}-lt-{group_values[1]}_measure-{feature_label}_fwhm-{fwhm}_TStatistics"
+            tstat_plot_filename = output_filename + ".png"
+            print(f"Saving plot of T-map to {tstat_plot_filename}")
+            plot_surf_stat_map(
+                Mesh(coordinates=coordinates, faces=faces),
+                slm_model.t,
+                output_file=tstat_plot_filename,
+            )
+            from scipy.io import savemat
+            t_value_with_mask = slm_model.t * mask  # Note: Is this really necessary??
+            tstat_mat_filename = output_filename + ".mat"
+            print(f"Saving T-map to {tstat_mat_filename}")
+            savemat(
+                tstat_mat_filename,
+                {"tvaluewithmask": t_value_with_mask},
+            )
+            output_filename = f"group-{group_label}_{group_values[0]}-lt-{group_values[1]}_measure-{feature_label}_fwhm-{fwhm}_correctedPValue"
+            pval_plot_filename = output_filename + ".png"
+            plot_surf_stat_map(
+                Mesh(coordinates=coordinates, faces=faces),
+                slm_model.P["pval"]["C"],
+                output_file=pval_plot_filename,
+            )
         else:
             print(
                 "The contrast here is the interaction between one "
@@ -173,19 +214,35 @@ if __name__ == "__main__":
         os.path.dirname(os.path.realpath(__file__))
     )
     caps_dir = Path(
-        "/network/lustre/iss02/aramis/project/clinica/data_ci/StatisticsSurface"
+        #"/network/lustre/iss02/aramis/project/clinica/data_ci/StatisticsSurface"
+        "/Users/nicolas.gensollen/GitRepos/clinica_data_ci/data_ci/StatisticsSurface"
     )
-    inputdir = caps_dir / Path("in/caps/subjects")
-    surface_file = _get_t1_freesurfer_custom_file_template(input_dir)
-    outputdir = None
+    input_dir = caps_dir / Path("in/caps/subjects")
+    output_dir = Path("./out")
     tsv_file = caps_dir / Path("in/subjects.tsv")
     design_matrix = "1+group"
-    contrast: "group"
-    strformat: "\t"
-    glm_type: "group_comparison"
-    group_label: "Test"
-    freesurfer_home: PathLike,
-    surface_file: PathLike,
-    feature_label: str,
-    parameters: dict,
-    clinica_surfstat()
+    contrast = "group"
+    strformat = "\t"
+    glm_type = "group_comparison"
+    group_label = "UnitTest"
+    freesurfer_home = Path("/Applications/freesurfer/7.2.0/")
+    print(f"FreeSurfer home : {freesurfer_home}")
+    surface_file = _get_t1_freesurfer_custom_file_template(input_dir)
+    print(f"Surface file : {surface_file}")
+    feature_label = "cortical-thickness"
+    parameters = dict()
+    clinica_surfstat(
+        input_dir,
+        output_dir,
+        tsv_file,
+        design_matrix,
+        contrast,
+        strformat,
+        glm_type,
+        group_label,
+        freesurfer_home,
+        surface_file,
+        feature_label,
+        parameters,
+    )
+
