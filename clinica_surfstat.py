@@ -1,5 +1,6 @@
 
 import os
+import warnings
 from os import PathLike
 import numpy as np
 import pandas as pd
@@ -7,6 +8,10 @@ from pathlib import Path
 from string import Template
 from typing import Tuple, Dict
 import matplotlib.pyplot as plt
+from nilearn.surface import Mesh, load_surf_mesh
+from brainstat.stats.terms import FixedEffect
+from brainstat.stats.SLM import SLM
+from scipy.stats import t
 
 
 DEFAULT_FWHM = 20
@@ -20,7 +25,7 @@ TSV_SECOND_COLUMN = "session_id"
 def _extract_parameters(parameters: Dict) -> Tuple[float, float, float, float]:
     fwhm = DEFAULT_FWHM
     if "sizeoffwhm" in parameters:
-        fwhm = parameters["sizeoffwhm "]
+        fwhm = parameters["sizeoffwhm"]
     threshold_uncorrected_pvalue = DEFAULT_THRESHOLD_UNCORRECTED_P_VALUE
     if "thresholduncorrectedpvalue" in parameters:
         threshold_uncorrected_pvalue = parameters["thresholduncorrectedpvalue"]
@@ -29,12 +34,14 @@ def _extract_parameters(parameters: Dict) -> Tuple[float, float, float, float]:
         threshold_corrected_pvalue = parameters["thresholdcorrectedpvalue"]
     cluster_threshold = DEFAULT_CLUSTER_THRESHOLD
     if "clusterthreshold" in parameters:
-        cluster_threshold = parameters["cluster_threshold"]
+        cluster_threshold = parameters["clusterthreshold"]
     return fwhm, threshold_uncorrected_pvalue, threshold_corrected_pvalue, cluster_threshold
 
 
-def _read_and_check_tsv_file(tsv_file: PathLike, strformat: str) -> pd.DataFrame:
-    tsv_data = pd.read_csv(tsv_file, sep=strformat)
+def _read_and_check_tsv_file(tsv_file: PathLike) -> pd.DataFrame:
+    if not tsv_file.exists():
+        raise FileNotFoundError(f"File {tsv_file} does not exist.")
+    tsv_data = pd.read_csv(tsv_file, sep="\t")
     if len(tsv_data.columns) < 2:
         raise ValueError(
             f"The TSV data in {tsv_file} should have at least 2 columns."
@@ -57,7 +64,12 @@ def _get_t1_freesurfer_custom_file_template(base_dir):
     )
 
 
-def _build_thickness_array(input_dir: PathLike, surface_file, df_subjects: pd.DataFrame, fwhm) -> np.ndarray:
+def _build_thickness_array(
+        input_dir: PathLike,
+        surface_file: Template,
+        df_subjects: pd.DataFrame,
+        fwhm: float,
+) -> np.ndarray:
     from nibabel.freesurfer.mghformat import load
     thickness = []
     for idx, row in df_subjects.iterrows():
@@ -70,22 +82,32 @@ def _build_thickness_array(input_dir: PathLike, surface_file, df_subjects: pd.Da
                 )
             ).get_fdata() for hemi in ['lh', 'rh']
         )
-        Y = np.vstack(parts)
-        thickness.append(Y.flatten())
+        combined = np.vstack(parts)
+        thickness.append(combined.flatten())
     thickness = np.vstack(thickness)
-    assert thickness.shape[0] == len(df_subjects)
+    if thickness.shape[0] != len(df_subjects):
+        raise ValueError(
+            f"Unexpected shape for thickness array : {thickness.shape}. "
+            f"Expected {len(df_subjects)} rows."
+        )
     return thickness
 
 
-def _check_contrast(contrast: str, df_subjects: pd.DataFrame) -> Tuple[str, bool]:
+def _check_contrast(
+        contrast: str,
+        df_subjects: pd.DataFrame,
+        glm_type: str,
+) -> Tuple[str, str, bool]:
     absolute_contrast = contrast
     with_interaction = False
+    contrast_sign = "positive"
     if contrast.startswith("-"):
-        absolute_contrast = contrast[1:]
+        absolute_contrast = contrast[1:].lstrip()
+        contrast_sign = "negative"
     if "*" in contrast:
         with_interaction = True
-        print(
-            "You include interaction as covariate in you model, "
+        warnings.warn(
+            "You included interaction as covariate in your model, "
             "please carefully check the format of your tsv files."
         )
     else:
@@ -93,12 +115,49 @@ def _check_contrast(contrast: str, df_subjects: pd.DataFrame) -> Tuple[str, bool
             raise ValueError(
                 f"Column {absolute_contrast} does not exist in provided TSV file."
             )
-        unique_labels = np.unique(df_subjects[absolute_contrast])
-        if len(unique_labels) != 2:
-            raise ValueError(
-                "For group comparison, there should be just 2 different groups!"
-            )
-    return absolute_contrast, with_interaction
+        if glm_type == "group_comparison":
+            unique_labels = np.unique(df_subjects[absolute_contrast])
+            if len(unique_labels) != 2:
+                raise ValueError(
+                    "For group comparison, there should be just 2 different groups!"
+                )
+    return absolute_contrast, contrast_sign, with_interaction
+
+
+def _print_clusters(slm_model, threshold):
+    """Print results related to total number of clusters
+    and significative clusters.
+    """
+    print("#" * 40)
+    print("After correction (Clusterwise Correction for Multiple Comparisons): ")
+    df = slm_model.P['clus'][1]
+    print(df)
+    print(f"Clusters found: {len(df)}")
+    print(f"Significative clusters (after correction): {len(df[df['P'] <= threshold])}")
+
+
+def _plot_stat_map(mesh, texture, filename, threshold=None, verbose=True):
+    from nilearn.plotting import plot_surf_stat_map
+    plot_filename = filename + ".png"
+    if verbose:
+        print(f"--> Saving plot to {plot_filename}")
+    plot_surf_stat_map(
+        mesh, texture, threshold=threshold, output_file=plot_filename
+    )
+
+
+def _save_to_mat(texture, mask, filename, key, verbose=True):
+    from scipy.io import savemat
+    masked_texture = texture
+    if mask is not None:
+        masked_texture *= mask
+    mat_filename = filename + ".mat"
+    if verbose:
+        print(f"--> Saving matrix to {mat_filename}")
+    savemat(
+        mat_filename,
+        {key: masked_texture},
+    )
 
 
 def clinica_surfstat(
@@ -107,29 +166,80 @@ def clinica_surfstat(
     tsv_file: PathLike,
     design_matrix: str,
     contrast: str,
-    strformat: str,
     glm_type: str,
     group_label: str,
     freesurfer_home: PathLike,
     surface_file: PathLike,
     feature_label: str,
     parameters: dict,
+    verbose=True,
 ):
-    """TODO
+    """This function mimics the previous function `clinica_surfstat`
+    written in MATLAB and relying on the MATLAB package SurfStat.
+    This implementation is written in pure Python and rely on the
+    package brainstat for GLM modeling.
 
     Parameters
     ----------
+    input_dir : PathLike
+        Input folder.
+
+    output_dir : PathLike
+        Output folder for storing results.
+
+    tsv_file : PathLike
+        Path to the TSV file `subjects.tsv` which contains the
+        necessary metadata to run the statistical analysis.
+
+        .. warning::
+            The column names need to be accurate because they
+            are used to defined contrast and model terms.
+            Please double check for typos.
+
+    design_matrix : str
+        Design matrix in string format. For example "1+Label"
+
+    contrast : str
+        The contrast to be used in the GLM.
+
+        .. warning::
+            The contrast needs to be in the design matrix.
+
     glm_type : {"group_comparison", "correlation"}
-        Type of GLM to run.
+        Type of GLM to run:
+            - "group_comparison": Performs group comparison.
+              For example "AD - ND".
+            - "correlation": Performs correlation analysis.
+
+    group_label : str
+        ??
+
+    freesurfer_home : PathLike
+        Path to the home folder of Freesurfer.
+        This is required to get the fsaverage templates.
+
+    surface_file : PathLike
+        
     """
-    from nilearn.surface import Mesh, load_surf_mesh
-    fwhm, threshold_uncorrected_pvalue, threshold_corrected_pvalue, cluster_threshold = _extract_parameters(parameters)
+    (
+        fwhm, threshold_uncorrected_pvalue,
+        threshold_corrected_pvalue, cluster_threshold,
+    ) = _extract_parameters(parameters)
     fsaverage_path = (freesurfer_home / Path("subjects/fsaverage/surf"))
-    print(f"fsaverage path : {fsaverage_path}")
-    df_subjects = _read_and_check_tsv_file(tsv_file, strformat)
+    if verbose:
+        print(f"--> fsaverage path : {fsaverage_path}")
+    df_subjects = _read_and_check_tsv_file(tsv_file)
     n_subjects = len(df_subjects)
-    absolute_contrast, with_interaction = _check_contrast(contrast, df_subjects)
-    thickness = _build_thickness_array(input_dir, surface_file, df_subjects, fwhm)
+    (
+        absolute_contrast,
+        contrast_sign,
+        with_interaction
+    ) = _check_contrast(
+        contrast, df_subjects, glm_type
+    )
+    thickness = _build_thickness_array(
+        input_dir, surface_file, df_subjects, fwhm
+    )
     mask = thickness[0, :] > 0
     meshes = [
         load_surf_mesh(str(fsaverage_path / Path(f"{hemi}.pial")))
@@ -146,18 +256,19 @@ def clinica_surfstat(
         "coord": coordinates,
         "tri": faces,
     }
-    print(f"Absolute contrast = {absolute_contrast}")
-    print(f"Mask shape = {mask.shape}")
-    group_values = np.unique(df_subjects[absolute_contrast])
-    contrast_g = (
-        (df_subjects[absolute_contrast] == group_values[0]).astype(int) -
-        (df_subjects[absolute_contrast] == group_values[1]).astype(int)
+    average_mesh = Mesh(
+        coordinates=coordinates,
+        faces=faces,
     )
     if glm_type == "group_comparison":
-        print(f"The GLM linear model is: {design_matrix}")
+        if verbose:
+            print(f"--> The GLM linear model is: {design_matrix}")
+        group_values = np.unique(df_subjects[absolute_contrast])
+        contrast_g = (
+            (df_subjects[absolute_contrast] == group_values[0]).astype(int) -
+            (df_subjects[absolute_contrast] == group_values[1]).astype(int)
+        )
         if not with_interaction:
-            from brainstat.stats.terms import FixedEffect
-            from brainstat.stats.SLM import SLM
             model = FixedEffect(df_subjects[absolute_contrast])
             slm_model = SLM(
                 model,
@@ -167,42 +278,85 @@ def clinica_surfstat(
                 correction=["fdr", "rft"],
                 cluster_threshold=cluster_threshold,
             )
+            if verbose:
+                print("--> Fitting the SLM model...")
             slm_model.fit(thickness)
-            print("T-values :")
-            print(slm_model.t)
-            from nilearn.plotting import plot_surf_stat_map
-            output_filename = f"group-{group_label}_{group_values[0]}-lt-{group_values[1]}_measure-{feature_label}_fwhm-{fwhm}_TStatistics"
-            tstat_plot_filename = output_filename + ".png"
-            print(f"Saving plot of T-map to {tstat_plot_filename}")
-            plot_surf_stat_map(
-                Mesh(coordinates=coordinates, faces=faces),
-                slm_model.t,
-                output_file=tstat_plot_filename,
+            uncorrected_pvalues = 1 - t.cdf(slm_model.t, slm_model.df)
+            filename_root = (
+                f"group-{group_label}_{group_values[0]}-lt-{group_values[1]}_"
+                f"measure-{feature_label}_fwhm-{fwhm}"
             )
-            from scipy.io import savemat
-            t_value_with_mask = slm_model.t * mask  # Note: Is this really necessary??
-            tstat_mat_filename = output_filename + ".mat"
-            print(f"Saving T-map to {tstat_mat_filename}")
-            savemat(
-                tstat_mat_filename,
-                {"tvaluewithmask": t_value_with_mask},
-            )
-            output_filename = f"group-{group_label}_{group_values[0]}-lt-{group_values[1]}_measure-{feature_label}_fwhm-{fwhm}_correctedPValue"
-            pval_plot_filename = output_filename + ".png"
-            plot_surf_stat_map(
-                Mesh(coordinates=coordinates, faces=faces),
-                slm_model.P["pval"]["C"],
-                output_file=pval_plot_filename,
-            )
+            for name, key, texture, _mask, threshold in zip(
+                    ["_TStatistics", "_uncorrectedPValue", "_correctedPValue"],
+                    ["tvaluewithmask", "uncorrectedpvaluesstruct", "correctedpvaluesstruct"],
+                    [slm_model.t, uncorrected_pvalues, slm_model.P["pval"]['C']],
+                    [mask, mask, None],
+                    [None, threshold_uncorrected_pvalue, cluster_threshold],
+            ):
+                _plot_stat_map(
+                    average_mesh,
+                    texture,
+                    filename_root + name,
+                    threshold=threshold,
+                    verbose=verbose,
+                )
+                _save_to_mat(
+                    texture,
+                    _mask,
+                    filename_root + name,
+                    key,
+                    verbose=verbose,
+                )
+            _print_clusters(slm_model, threshold_corrected_pvalue)
         else:
-            print(
-                "The contrast here is the interaction between one "
-                "continuous variable and one categorical "
-                f"variable: {contrast}"
-            )
+            if verbose:
+                print(
+                    "--> The contrast here is the interaction between one "
+                    "continuous variable and one categorical "
+                    f"variable: {contrast}"
+                )
 
     elif glm_type == "correlation":
-        pass
+        model = FixedEffect(df_subjects[absolute_contrast])
+        contrast_ = df_subjects[absolute_contrast]
+        if contrast_sign == "negative":
+            contrast_ *= -1
+        slm_model = SLM(
+            model,
+            contrast_,
+            surf=average_surface,
+            mask=mask,
+            correction=["fdr", "rft"],
+            cluster_threshold=cluster_threshold,
+        )
+        slm_model.fit(thickness)
+        uncorrected_pvalues = 1 - t.cdf(slm_model.t, slm_model.df)
+        filename_root = (
+            f"group-{group_label}_correlation-{contrast}-{contrastsign}_"
+            f"measure-{feature_label}_fwhm-{fwhm}"
+        )
+        for name, key, texture, _mask, threshold in zip(
+                ["_TStatistics", "_uncorrectedPValue", "_correctedPValue"],
+                ["tvaluewithmask", "uncorrectedpvaluesstruct", "correctedpvaluesstruct"],
+                [slm_model.t, uncorrected_pvalues, slm_model.P["pval"]['C']],
+                [mask, mask, None],
+                [None, threshold_uncorrected_pvalue, cluster_threshold],
+        ):
+            _plot_stat_map(
+                average_mesh,
+                texture,
+                filename_root + name,
+                threshold=threshold,
+                verbose=verbose,
+            )
+            _save_to_mat(
+                texture,
+                _mask,
+                filename_root + name,
+                key,
+                verbose=verbose,
+            )
+        _print_clusters(slm_model, threshold_corrected_pvalue)
     else:
         raise ValueError(
             "Check out if you define the glmtype flag correctly, "
@@ -222,7 +376,6 @@ if __name__ == "__main__":
     tsv_file = caps_dir / Path("in/subjects.tsv")
     design_matrix = "1+group"
     contrast = "group"
-    strformat = "\t"
     glm_type = "group_comparison"
     group_label = "UnitTest"
     freesurfer_home = Path("/Applications/freesurfer/7.2.0/")
@@ -237,7 +390,6 @@ if __name__ == "__main__":
         tsv_file,
         design_matrix,
         contrast,
-        strformat,
         glm_type,
         group_label,
         freesurfer_home,
