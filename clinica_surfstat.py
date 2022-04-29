@@ -1,5 +1,6 @@
 
 import os
+from time import time
 import warnings
 from os import PathLike
 import numpy as np
@@ -12,10 +13,11 @@ from nilearn.surface import Mesh, load_surf_mesh
 from brainstat.stats.terms import FixedEffect
 from brainstat.stats.SLM import SLM
 from scipy.stats import t
+from functools import reduce
 
 
 DEFAULT_FWHM = 20
-DEFAULT_THRESHOLD_UNCORRECTED_P_VALUE = 0
+DEFAULT_THRESHOLD_UNCORRECTED_P_VALUE = 0.001
 DEFAULT_THRESHOLD_CORRECTED_P_VALUE = 0.05
 DEFAULT_CLUSTER_THRESHOLD = 0.001
 TSV_FIRST_COLUMN = "participant_id"
@@ -146,18 +148,71 @@ def _plot_stat_map(mesh, texture, filename, threshold=None, verbose=True):
     )
 
 
-def _save_to_mat(texture, mask, filename, key, verbose=True):
+def _save_to_mat(struct, filename, key, verbose=True):
     from scipy.io import savemat
-    masked_texture = texture
-    if mask is not None:
-        masked_texture *= mask
+    #masked_texture = texture
+    #mask_ = np.ones_like(texture)
+    #if mask is not None:
+    #    mask_ = mask
+    #if threshold is None:
+    #    threshold = 0.0
+    #masked_texture = texture * mask_
     mat_filename = filename + ".mat"
     if verbose:
         print(f"--> Saving matrix to {mat_filename}")
     savemat(
         mat_filename,
-        {key: masked_texture},
+        {key: struct},
     )
+
+
+def _build_model(design_matrix: str, df: pd.DataFrame):
+    """Build a brainstat model from the design matrix in
+    string format.
+    This function assumes that the design matrix is formatted
+    in the following way:
+
+        1 + factor_1 + factor_2 + ...
+
+    Or:
+
+        factor_1 + factor_2 + ... (in this case the intercept will
+        be added automatically).
+    """
+    if len(design_matrix) == 0:
+        raise ValueError("Design matrix cannot be empty.")
+    if "+" in design_matrix:
+        terms = [_.strip() for _ in design_matrix.split("+")]
+    else:
+        terms = [design_matrix.strip()]
+    model = []
+    for term in terms:
+        # Intercept is automatically included in brainstat
+        if term == "1":
+            continue
+        # Handles the interaction effects
+        if "*" in term:
+            sub_terms = [_.strip() for _ in term.split("*")]
+            model_term = reduce(
+                lambda x, y: x * y,
+                [_build_model_term(_, df) for _ in sub_terms]
+            )
+        else:
+            model_term = _build_model_term(term, df)
+        model.append(model_term)
+    if len(model) == 1:
+        return model[0]
+    return reduce(lambda x, y: x + y, model)
+
+
+def _build_model_term(term: str, df: pd.DataFrame) -> FixedEffect:
+    if term not in df.columns:
+        raise ValueError(
+            f"Term {term} from the design matrix is not "
+            "in the columns of the provided TSV file. "
+            "Please make sure that there is no typo."
+        )
+    return FixedEffect(df[term])
 
 
 def clinica_surfstat(
@@ -212,14 +267,12 @@ def clinica_surfstat(
             - "correlation": Performs correlation analysis.
 
     group_label : str
-        ??
 
     freesurfer_home : PathLike
         Path to the home folder of Freesurfer.
         This is required to get the fsaverage templates.
 
     surface_file : PathLike
-        
     """
     (
         fwhm, threshold_uncorrected_pvalue,
@@ -237,29 +290,38 @@ def clinica_surfstat(
     ) = _check_contrast(
         contrast, df_subjects, glm_type
     )
+    start = time()
     thickness = _build_thickness_array(
         input_dir, surface_file, df_subjects, fwhm
     )
+    print(f"--> Building thickness array took {time() - start} seconds.")
     mask = thickness[0, :] > 0
     meshes = [
         load_surf_mesh(str(fsaverage_path / Path(f"{hemi}.pial")))
         for hemi in ['lh', 'rh']
     ]
     coordinates = np.vstack([mesh.coordinates for mesh in meshes])
-    faces = np.vstack([mesh.faces for mesh in meshes])
+    faces = np.vstack([
+        meshes[0].faces,
+        meshes[1].faces + meshes[0].coordinates.shape[0]
+    ])
+    average_mesh = Mesh(
+        coordinates=coordinates,
+        faces=faces,
+    )
     ##################
     ## UGLY HACK !!! Need investigation
     ##################
-    faces += 1
+    # Uncomment the following line if getting an error
+    # with negative values in bincount in Brainstat.
+    # Not sure, but might be a bug in BrainStat...
+    #
+    #faces += 1
     #################
     average_surface = {
         "coord": coordinates,
         "tri": faces,
     }
-    average_mesh = Mesh(
-        coordinates=coordinates,
-        faces=faces,
-    )
     if glm_type == "group_comparison":
         if verbose:
             print(f"--> The GLM linear model is: {design_matrix}")
@@ -269,7 +331,8 @@ def clinica_surfstat(
             (df_subjects[absolute_contrast] == group_values[1]).astype(int)
         )
         if not with_interaction:
-            model = FixedEffect(df_subjects[absolute_contrast])
+            start = time()
+            model = _build_model(design_matrix, df_subjects)
             slm_model = SLM(
                 model,
                 contrast=contrast_g,
@@ -281,17 +344,88 @@ def clinica_surfstat(
             if verbose:
                 print("--> Fitting the SLM model...")
             slm_model.fit(thickness)
-            uncorrected_pvalues = 1 - t.cdf(slm_model.t, slm_model.df)
+            if verbose:
+                print(f"--> Building and fitting the SLM model took {time() - start} seconds.")
+            t_values = np.nan_to_num(slm_model.t)
+            uncorrected_pvalues = 1 - t.cdf(t_values, slm_model.df)
+
+            # The ugly code after this point is to enforce backward compatibility
+            # with outputs from the previous MATLAB code...
+            #
             filename_root = (
                 f"group-{group_label}_{group_values[0]}-lt-{group_values[1]}_"
                 f"measure-{feature_label}_fwhm-{fwhm}"
             )
-            for name, key, texture, _mask, threshold in zip(
+            structs = [
+                t_values,
+                {
+                    'P': uncorrected_pvalues,
+                    'mask': mask,
+                    'thresh': threshold_uncorrected_pvalue,
+                },
+                {
+                    'P': slm_model.P['pval']['P'],
+                    'C': slm_model.P['pval']['C'],
+                    'mask': mask,
+                    'thresh': threshold_corrected_pvalue,
+                }
+            ]
+            for name, key, struct in zip(
                     ["_TStatistics", "_uncorrectedPValue", "_correctedPValue"],
                     ["tvaluewithmask", "uncorrectedpvaluesstruct", "correctedpvaluesstruct"],
-                    [slm_model.t, uncorrected_pvalues, slm_model.P["pval"]['C']],
-                    [mask, mask, None],
-                    [None, threshold_uncorrected_pvalue, cluster_threshold],
+                    structs,
+            ):
+                if isinstance(struct, dict):
+                    texture = struct['P']
+                else:
+                    texture = struct
+                _plot_stat_map(
+                    average_mesh,
+                    texture,
+                    filename_root + name,
+                    threshold=None,
+                    verbose=verbose,
+                )
+                _save_to_mat(
+                    struct,
+                    filename_root + name,
+                    key,
+                    verbose=verbose,
+                )
+            _print_clusters(slm_model, threshold_corrected_pvalue)
+        ################
+        # The rest of the function is only copy-pasted code for now.
+        # I think it can be factorized a lot once we have meaningful results.
+        ################
+        else:
+            if verbose:
+                print(
+                    "--> The contrast here is the interaction between one "
+                    "continuous variable and one categorical "
+                    f"variable: {contrast}"
+                )
+            model = _build_model(design_matrix, df_subjects)
+            contrast_interaction = contrast_g # TODO: CHANGE THIS
+            slm_model = SLM(
+                model,
+                contrast=contrast_interaction,
+                surf=average_surface,
+                mask=mask,
+                correction=["fdr", "rft"],
+                cluster_threshold=cluster_threshold,
+            )
+            if verbose:
+                print("--> Fitting the SLM model...")
+            slm_model.fit(thickness)
+            filename_root = (
+                f"interaction-{contrast}_measure-{feature_label}_fwhm-{fwhm}"
+            )
+            for name, key, texture, _mask, threshold in zip(
+                    ["_TStatistics", "_correctedPValue"],
+                    ["tvaluewithmask", "correctedpvaluesstruct"],
+                    [slm_model.t, slm_model.P["pval"]['C']],
+                    [mask, None],
+                    [None, cluster_threshold],
             ):
                 _plot_stat_map(
                     average_mesh,
@@ -303,21 +437,15 @@ def clinica_surfstat(
                 _save_to_mat(
                     texture,
                     _mask,
+                    threshold,
                     filename_root + name,
                     key,
                     verbose=verbose,
                 )
             _print_clusters(slm_model, threshold_corrected_pvalue)
-        else:
-            if verbose:
-                print(
-                    "--> The contrast here is the interaction between one "
-                    "continuous variable and one categorical "
-                    f"variable: {contrast}"
-                )
 
     elif glm_type == "correlation":
-        model = FixedEffect(df_subjects[absolute_contrast])
+        model = _build_model(design_matrix, df_subjects)
         contrast_ = df_subjects[absolute_contrast]
         if contrast_sign == "negative":
             contrast_ *= -1
@@ -352,6 +480,7 @@ def clinica_surfstat(
             _save_to_mat(
                 texture,
                 _mask,
+                threshold,
                 filename_root + name,
                 key,
                 verbose=verbose,
@@ -374,7 +503,7 @@ if __name__ == "__main__":
     input_dir = caps_dir / Path("in/caps/subjects")
     output_dir = Path("./out")
     tsv_file = caps_dir / Path("in/subjects.tsv")
-    design_matrix = "1+group"
+    design_matrix = "1 + age + sex + group"
     contrast = "group"
     glm_type = "group_comparison"
     group_label = "UnitTest"
@@ -382,7 +511,7 @@ if __name__ == "__main__":
     print(f"FreeSurfer home : {freesurfer_home}")
     surface_file = _get_t1_freesurfer_custom_file_template(input_dir)
     print(f"Surface file : {surface_file}")
-    feature_label = "cortical-thickness"
+    feature_label = "ct"
     parameters = dict()
     clinica_surfstat(
         input_dir,

@@ -1,6 +1,8 @@
 import os
 import pytest
 import pandas as pd
+import numpy as np
+from numpy.testing import assert_array_equal
 from pathlib import Path
 
 CURRENT_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -26,7 +28,7 @@ def test_extract_parameters():
         threshold_corrected_pvalue, cluster_threshold,
     ) = _extract_parameters({})
     assert fwhm == 20
-    assert threshold_uncorrected_pvalue == 0
+    assert threshold_uncorrected_pvalue == 0.001
     assert threshold_corrected_pvalue == 0.05
     assert cluster_threshold == 0.001
 
@@ -116,3 +118,69 @@ def test_check_contrast():
     assert absolute_contrast == "age"
     assert contrast_sign == "negative"
     assert not with_interaction
+
+
+def test_build_model():
+    from brainstat.stats.terms import FixedEffect
+    from clinica_surfstat import _build_model, _read_and_check_tsv_file
+    df_subjects = _read_and_check_tsv_file(Path(CURRENT_DIR) / "data/subjects.tsv")
+    for design in ["1 + age", "1+age", "age +1", "age"]:
+        model = _build_model(design, df_subjects)
+        assert isinstance(model, FixedEffect)
+        assert len(model.m.columns) == 2
+        assert_array_equal(
+            model.intercept,
+            np.array([1, 1, 1, 1, 1, 1, 1])
+        )
+        assert_array_equal(
+            model.age,
+            np.array([78. , 73.4, 70.8, 82.3, 60.6, 72.1, 74.2])
+        )
+    model = _build_model("1 + age + sex", df_subjects)
+    assert isinstance(model, FixedEffect)
+    assert len(model.m.columns) == 4
+    assert_array_equal(
+        model.intercept,
+        np.array([1, 1, 1, 1, 1, 1, 1])
+    )
+    assert_array_equal(
+        model.age,
+        np.array([78. , 73.4, 70.8, 82.3, 60.6, 72.1, 74.2])
+    )
+    assert_array_equal(
+        model.sex_Female,
+        np.array([1, 0, 1, 1, 1, 0, 1])
+    )
+    assert_array_equal(
+        model.sex_Male,
+        np.array([0, 1, 0, 0, 0, 1, 0])
+    )
+
+    model = _build_model("1 + age + sex + age * sex", df_subjects)
+    assert isinstance(model, FixedEffect)
+    assert len(model.m.columns) == 6
+    assert_array_equal(
+        model.intercept,
+        np.array([1, 1, 1, 1, 1, 1, 1])
+    )
+    assert_array_equal(
+        model.age,
+        np.array([78. , 73.4, 70.8, 82.3, 60.6, 72.1, 74.2])
+    )
+    assert_array_equal(
+        model.sex_Female,
+        np.array([1, 0, 1, 1, 1, 0, 1])
+    )
+    assert_array_equal(
+        model.sex_Male,
+        np.array([0, 1, 0, 0, 0, 1, 0])
+    )
+    assert_array_equal(
+        getattr(model, "age*sex_Female"),
+        np.array([78. ,  0. , 70.8, 82.3, 60.6,  0. , 74.2])
+    )
+    assert_array_equal(
+        getattr(model, "age*sex_Male"),
+        np.array([ 0. , 73.4,  0. ,  0. ,  0. , 72.1,  0. ])
+    )
+
