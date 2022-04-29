@@ -320,7 +320,7 @@ def clinica_surfstat(
     #################
     average_surface = {
         "coord": coordinates,
-        "tri": faces,
+        "tri": faces + 1,
     }
     if glm_type == "group_comparison":
         if verbose:
@@ -525,5 +525,6 @@ if __name__ == "__main__":
         surface_file,
         feature_label,
         parameters,
+        verbose=True,
     )
 
