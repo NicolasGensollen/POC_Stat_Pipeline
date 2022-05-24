@@ -15,6 +15,7 @@ from brainstat.stats.SLM import SLM
 from scipy.stats import t
 from functools import reduce
 
+from numpy.testing import assert_array_almost_equal
 
 DEFAULT_FWHM = 20
 DEFAULT_THRESHOLD_UNCORRECTED_P_VALUE = 0.001
@@ -205,14 +206,22 @@ def _build_model(design_matrix: str, df: pd.DataFrame):
     return reduce(lambda x, y: x + y, model)
 
 
+MISSING_TERM_ERROR_MSG = Template(
+    "Term ${term} from the design matrix is not in the columns of the "
+    "provided TSV file. Please make sure that there is no typo."
+)
+
+
 def _build_model_term(term: str, df: pd.DataFrame) -> FixedEffect:
     if term not in df.columns:
-        raise ValueError(
-            f"Term {term} from the design matrix is not "
-            "in the columns of the provided TSV file. "
-            "Please make sure that there is no typo."
-        )
+        raise ValueError(MISSING_TERM_ERROR_MSG.safe_substitute(term=term))
     return FixedEffect(df[term])
+
+
+def _is_categorical(df: pd.DataFrame, column: str) -> bool:
+    if column not in df.columns:
+        raise ValueError(MISSING_TERM_ERROR_MSG.safe_substitute(term=column))
+    return not df[column].dtype.name.startswith("float")
 
 
 def clinica_surfstat(
@@ -290,11 +299,9 @@ def clinica_surfstat(
     ) = _check_contrast(
         contrast, df_subjects, glm_type
     )
-    start = time()
     thickness = _build_thickness_array(
         input_dir, surface_file, df_subjects, fwhm
     )
-    print(f"--> Building thickness array took {time() - start} seconds.")
     mask = thickness[0, :] > 0
     meshes = [
         load_surf_mesh(str(fsaverage_path / Path(f"{hemi}.pial")))
@@ -320,83 +327,30 @@ def clinica_surfstat(
     #################
     average_surface = {
         "coord": coordinates,
-        "tri": faces + 1,
+        "tri": faces,
     }
+    if verbose:
+        print(f"--> The GLM linear model is: {design_matrix}")
+        print(f"--> The GLM type is: {glm_type}")
+    contrasts = dict()
+    filenames = dict()
     if glm_type == "group_comparison":
-        if verbose:
-            print(f"--> The GLM linear model is: {design_matrix}")
-        group_values = np.unique(df_subjects[absolute_contrast])
-        contrast_g = (
-            (df_subjects[absolute_contrast] == group_values[0]).astype(int) -
-            (df_subjects[absolute_contrast] == group_values[1]).astype(int)
-        )
         if not with_interaction:
-            start = time()
-            model = _build_model(design_matrix, df_subjects)
-            slm_model = SLM(
-                model,
-                contrast=contrast_g,
-                surf=average_surface,
-                mask=mask,
-                correction=["fdr", "rft"],
-                cluster_threshold=cluster_threshold,
+            if not _is_categorical(df_subjects, absolute_contrast):
+                raise ValueError(
+                    "Contrast should refer to a categorical variable for group comparison. "
+                    "Please select 'correlation' for 'glm_type' otherwise."
             )
-            if verbose:
-                print("--> Fitting the SLM model...")
-            slm_model.fit(thickness)
-            if verbose:
-                print(f"--> Building and fitting the SLM model took {time() - start} seconds.")
-            t_values = np.nan_to_num(slm_model.t)
-            uncorrected_pvalues = 1 - t.cdf(t_values, slm_model.df)
-
-            # The ugly code after this point is to enforce backward compatibility
-            # with outputs from the previous MATLAB code...
-            #
-            filename_root = (
-                f"group-{group_label}_{group_values[0]}-lt-{group_values[1]}_"
-                f"measure-{feature_label}_fwhm-{fwhm}"
-            )
-            structs = [
-                t_values,
-                {
-                    'P': uncorrected_pvalues,
-                    'mask': mask,
-                    'thresh': threshold_uncorrected_pvalue,
-                },
-                {
-                    'P': slm_model.P['pval']['P'],
-                    'C': slm_model.P['pval']['C'],
-                    'mask': mask,
-                    'thresh': threshold_corrected_pvalue,
-                }
-            ]
-            for name, key, struct in zip(
-                    ["_TStatistics", "_uncorrectedPValue", "_correctedPValue"],
-                    ["tvaluewithmask", "uncorrectedpvaluesstruct", "correctedpvaluesstruct"],
-                    structs,
-            ):
-                if isinstance(struct, dict):
-                    texture = struct['P']
-                else:
-                    texture = struct
-                _plot_stat_map(
-                    average_mesh,
-                    texture,
-                    filename_root + name,
-                    threshold=None,
-                    verbose=verbose,
+            group_values = np.unique(df_subjects[absolute_contrast])
+            for contrast_type, (i, j) in zip(["positive", "negative"], [(0, 1), (1, 0)]):
+                contrast_name = f"{group_values[i]}-lt-{group_values[j]}"
+                contrasts[contrast_name] = (
+                    (df_subjects[absolute_contrast] == group_values[i]).astype(int) -
+                    (df_subjects[absolute_contrast] == group_values[j]).astype(int)
                 )
-                _save_to_mat(
-                    struct,
-                    filename_root + name,
-                    key,
-                    verbose=verbose,
+                filenames[contrast_name] = (
+                    output_dir / f"group-{group_label}_{contrast_name}_measure-{feature_label}_fwhm-{fwhm}"
                 )
-            _print_clusters(slm_model, threshold_corrected_pvalue)
-        ################
-        # The rest of the function is only copy-pasted code for now.
-        # I think it can be factorized a lot once we have meaningful results.
-        ################
         else:
             if verbose:
                 print(
@@ -404,93 +358,101 @@ def clinica_surfstat(
                     "continuous variable and one categorical "
                     f"variable: {contrast}"
                 )
-            model = _build_model(design_matrix, df_subjects)
-            contrast_interaction = contrast_g # TODO: CHANGE THIS
-            slm_model = SLM(
-                model,
-                contrast=contrast_interaction,
-                surf=average_surface,
-                mask=mask,
-                correction=["fdr", "rft"],
-                cluster_threshold=cluster_threshold,
-            )
-            if verbose:
-                print("--> Fitting the SLM model...")
-            slm_model.fit(thickness)
-            filename_root = (
-                f"interaction-{contrast}_measure-{feature_label}_fwhm-{fwhm}"
-            )
-            for name, key, texture, _mask, threshold in zip(
-                    ["_TStatistics", "_correctedPValue"],
-                    ["tvaluewithmask", "correctedpvaluesstruct"],
-                    [slm_model.t, slm_model.P["pval"]['C']],
-                    [mask, None],
-                    [None, cluster_threshold],
-            ):
-                _plot_stat_map(
-                    average_mesh,
-                    texture,
-                    filename_root + name,
-                    threshold=threshold,
-                    verbose=verbose,
+            contrast_elements = [_.strip() for _ in contrast.split("*")]
+            categorical = [_is_categorical(df_subjects, _) for _ in contrast_elements]
+            if len(contrast_elements) != 2 or sum(categorical) != 1:
+                raise ValueError(
+                    "The contrast must be an interaction between one continuous "
+                    "variable and one categorical variable. Your contrast contains "
+                    f"the following variables : {contrast_elements}"
                 )
-                _save_to_mat(
-                    texture,
-                    _mask,
-                    threshold,
-                    filename_root + name,
-                    key,
-                    verbose=verbose,
-                )
-            _print_clusters(slm_model, threshold_corrected_pvalue)
-
+            idx = 0 if categorical[0] else 1
+            categorical_contrast = contrast_elements[idx]
+            continue_contrast = contrast_elements[(idx + 1) % 2]
+            group_values = np.unique(df_subjects[categorical_contrast])
+            built_contrast = df_subjects[continue_contrast] * (
+                (df_subjects[categorical_contrast] == group_values[0]).astype(int)
+            ) - df_subjects[continue_contrast] * (
+                (df_subjects[categorical_contrast] == group_values[1]).astype(int)
+            )
+            contrasts[contrast] = built_contrast
+            filenames[contrast] = (
+                output_dir / f"interaction-{contrast}_measure-{feature_label}_fwhm-{fwhm}"
+            )
     elif glm_type == "correlation":
-        model = _build_model(design_matrix, df_subjects)
-        contrast_ = df_subjects[absolute_contrast]
+        built_contrast = df_subjects[absolute_contrast]
         if contrast_sign == "negative":
-            contrast_ *= -1
-        slm_model = SLM(
-            model,
-            contrast_,
-            surf=average_surface,
-            mask=mask,
-            correction=["fdr", "rft"],
-            cluster_threshold=cluster_threshold,
-        )
-        slm_model.fit(thickness)
-        uncorrected_pvalues = 1 - t.cdf(slm_model.t, slm_model.df)
-        filename_root = (
-            f"group-{group_label}_correlation-{contrast}-{contrastsign}_"
+            built_contrast *= -1
+        contrasts[contrast] = built_contrast
+        filenames[contrast] = output_dir / (
+            f"group-{group_label}_correlation-{contrast}-{contrast_sign}_"
             f"measure-{feature_label}_fwhm-{fwhm}"
         )
-        for name, key, texture, _mask, threshold in zip(
-                ["_TStatistics", "_uncorrectedPValue", "_correctedPValue"],
-                ["tvaluewithmask", "uncorrectedpvaluesstruct", "correctedpvaluesstruct"],
-                [slm_model.t, uncorrected_pvalues, slm_model.P["pval"]['C']],
-                [mask, mask, None],
-                [None, threshold_uncorrected_pvalue, cluster_threshold],
-        ):
-            _plot_stat_map(
-                average_mesh,
-                texture,
-                filename_root + name,
-                threshold=threshold,
-                verbose=verbose,
-            )
-            _save_to_mat(
-                texture,
-                _mask,
-                threshold,
-                filename_root + name,
-                key,
-                verbose=verbose,
-            )
-        _print_clusters(slm_model, threshold_corrected_pvalue)
     else:
         raise ValueError(
             "Check out if you define the glmtype flag correctly, "
             "or define your own general linear model, e,g MGLM."
         )
+    model = _build_model(design_matrix, df_subjects)
+    for contrast_name, model_contrast in contrasts.items():
+        filename_root = filenames[contrast_name]
+        slm_model = SLM(
+            model,
+            contrast=model_contrast,
+            surf=average_surface,
+            mask=mask,
+            two_tailed=True,
+            correction=["fdr", "rft"],
+            cluster_threshold=cluster_threshold,
+        )
+        if verbose:
+            print(f"--> Fitting the SLM model with contrast {contrast_name}...")
+        slm_model.fit(thickness)
+        model_coefficients = np.nan_to_num(slm_model.coef)
+        # beta_hat = np.linalg.pinv(model.matrix.values.T @ model.matrix.values) @ model.matrix.values.T @ thickness
+        # assert_array_almost_equal(beta_hat, np.nan_to_num(slm_model.coef))
+        t_values = np.nan_to_num(slm_model.t)
+        uncorrected_p_values = 1 - t.cdf(t_values, slm_model.df)
+        structs = [
+            t_values,
+            {
+                'P': uncorrected_p_values,
+                'mask': mask,
+                'thresh': threshold_uncorrected_pvalue,
+            },
+            {
+                'P': slm_model.P['pval']['P'],
+                'C': slm_model.P['pval']['C'],
+                'mask': mask,
+                'thresh': threshold_corrected_pvalue,
+            },
+            model_coefficients,
+            slm_model._fdr(),
+        ]
+        for name, key, struct in zip(
+                ["_TStatistics", "_uncorrectedPValue", "_correctedPValue", "coefficients", "FDR"],
+                ["tvaluewithmask", "uncorrectedpvaluesstruct", "correctedpvaluesstruct", "to_save", "FDR"],
+                structs,
+        ):
+            if isinstance(struct, dict):
+                texture = struct['P']
+            else:
+                texture = struct
+            if name != "coefficients":
+                _plot_stat_map(
+                    average_mesh,
+                    texture,
+                    str(filename_root) + name,
+                    threshold=None,
+                    verbose=verbose,
+                )
+            _save_to_mat(
+                struct,
+                str(filename_root) + name,
+                key,
+                verbose=verbose,
+            )
+        _print_clusters(slm_model, threshold_corrected_pvalue)
 
 if __name__ == "__main__":
     current_dir = Path(
@@ -503,9 +465,14 @@ if __name__ == "__main__":
     input_dir = caps_dir / Path("in/caps/subjects")
     output_dir = Path("./out")
     tsv_file = caps_dir / Path("in/subjects.tsv")
-    design_matrix = "1 + age + sex + group"
-    contrast = "group"
+    design_matrix = "1 + age + sex + age * sex"
+    #design_matrix = "1 + group + age + sex"
+    #design_matrix = "1 + sex"
+    #contrast = "group"
+    #contrast = "sex"
+    contrast = "age * sex"
     glm_type = "group_comparison"
+    #glm_type = "correlation"
     group_label = "UnitTest"
     freesurfer_home = Path("/Applications/freesurfer/7.2.0/")
     print(f"FreeSurfer home : {freesurfer_home}")
