@@ -224,6 +224,108 @@ def _is_categorical(df: pd.DataFrame, column: str) -> bool:
     return not df[column].dtype.name.startswith("float")
 
 
+def _get_contrasts_and_filenames(
+        glm_type: str,
+        contrast: str,
+        df: pd.DataFrame,
+):
+    (
+        abs_contrast,
+        contrast_sign,
+        with_interaction
+    ) = _check_contrast(
+        contrast, df, glm_type
+    )
+    if glm_type == "group_comparison":
+        if not with_interaction:
+            return _get_group_contrast_without_interaction(abs_contrast, df)
+        else:
+            return _get_group_contrast_with_interaction(abs_contrast, df)
+    elif glm_type == "correlation":
+        return _get_correlation_contrast(abs_contrast, df, contrast_sign)
+    else:
+        raise ValueError(
+            "Check out if you define the glmtype flag correctly, "
+            "or define your own general linear model, e,g MGLM."
+        )
+
+
+def _get_group_contrast_with_interaction(
+        contrast: str,
+        df: pd.DataFrame,
+):
+    """Build contrasts and filename roots for group GLMs with interaction."""
+    contrasts = dict()
+    filenames = dict()
+    contrast_elements = [_.strip() for _ in contrast.split("*")]
+    categorical = [_is_categorical(df, _) for _ in contrast_elements]
+    if len(contrast_elements) != 2 or sum(categorical) != 1:
+        raise ValueError(
+            "The contrast must be an interaction between one continuous "
+            "variable and one categorical variable. Your contrast contains "
+            f"the following variables : {contrast_elements}"
+        )
+    idx = 0 if categorical[0] else 1
+    categorical_contrast = contrast_elements[idx]
+    continue_contrast = contrast_elements[(idx + 1) % 2]
+    group_values = np.unique(df[categorical_contrast])
+    built_contrast = df[continue_contrast] * (
+        (df[categorical_contrast] == group_values[0]).astype(int)
+    ) - df[continue_contrast] * (
+        (df[categorical_contrast] == group_values[1]).astype(int)
+    )
+    contrasts[contrast] = built_contrast
+    filenames[contrast] = (
+        Template("interaction-${contrast_name}_measure-${feature_label}_fwhm-${fwhm}")
+    )
+    return contrasts, filenames
+
+
+def _get_group_contrast_without_interaction(
+        contrast: str,
+        df: pd.DataFrame,
+):
+    """Build contrasts and filename roots for group GLMs without interaction."""
+    contrasts = dict()
+    filenames = dict()
+    if not _is_categorical(df, contrast):
+        raise ValueError(
+            "Contrast should refer to a categorical variable for group comparison. "
+            "Please select 'correlation' for 'glm_type' otherwise."
+        )
+    group_values = np.unique(df[contrast])
+    for contrast_type, (i, j) in zip(["positive", "negative"], [(0, 1), (1, 0)]):
+        contrast_name = f"{group_values[i]}-lt-{group_values[j]}"
+        contrasts[contrast_name] = (
+            (df[contrast] == group_values[i]).astype(int) -
+            (df[contrast] == group_values[j]).astype(int)
+        )
+        filenames[contrast_name] = (
+            Template("group-${group_label}_${contrast_name}_measure-${feature_label}_fwhm-${fwhm}")
+        )
+    return contrasts, filenames
+
+
+def _get_correlation_contrast(
+        contrast: str,
+        df: pd.DataFrame,
+        contrast_sign: str,
+):
+    """Build contrasts and filename roots for correlation GLMs."""
+    contrasts = dict()
+    filenames = dict()
+    built_contrast = df[contrast]
+    if contrast_sign == "negative":
+        built_contrast *= -1
+    contrasts[contrast] = built_contrast
+    filenames[contrast] = Template(
+        "group-${group_label}_correlation-${contrast_name}-"
+        f"{contrast_sign}_"
+        "measure-${feature_label}_fwhm-${fwhm}"
+    )
+    return contrasts, filenames
+
+
 def clinica_surfstat(
     input_dir: PathLike,
     output_dir: PathLike,
@@ -292,13 +394,6 @@ def clinica_surfstat(
         print(f"--> fsaverage path : {fsaverage_path}")
     df_subjects = _read_and_check_tsv_file(tsv_file)
     n_subjects = len(df_subjects)
-    (
-        absolute_contrast,
-        contrast_sign,
-        with_interaction
-    ) = _check_contrast(
-        contrast, df_subjects, glm_type
-    )
     thickness = _build_thickness_array(
         input_dir, surface_file, df_subjects, fwhm
     )
@@ -332,70 +427,20 @@ def clinica_surfstat(
     if verbose:
         print(f"--> The GLM linear model is: {design_matrix}")
         print(f"--> The GLM type is: {glm_type}")
-    contrasts = dict()
-    filenames = dict()
-    if glm_type == "group_comparison":
-        if not with_interaction:
-            if not _is_categorical(df_subjects, absolute_contrast):
-                raise ValueError(
-                    "Contrast should refer to a categorical variable for group comparison. "
-                    "Please select 'correlation' for 'glm_type' otherwise."
-            )
-            group_values = np.unique(df_subjects[absolute_contrast])
-            for contrast_type, (i, j) in zip(["positive", "negative"], [(0, 1), (1, 0)]):
-                contrast_name = f"{group_values[i]}-lt-{group_values[j]}"
-                contrasts[contrast_name] = (
-                    (df_subjects[absolute_contrast] == group_values[i]).astype(int) -
-                    (df_subjects[absolute_contrast] == group_values[j]).astype(int)
-                )
-                filenames[contrast_name] = (
-                    output_dir / f"group-{group_label}_{contrast_name}_measure-{feature_label}_fwhm-{fwhm}"
-                )
-        else:
-            if verbose:
-                print(
-                    "--> The contrast here is the interaction between one "
-                    "continuous variable and one categorical "
-                    f"variable: {contrast}"
-                )
-            contrast_elements = [_.strip() for _ in contrast.split("*")]
-            categorical = [_is_categorical(df_subjects, _) for _ in contrast_elements]
-            if len(contrast_elements) != 2 or sum(categorical) != 1:
-                raise ValueError(
-                    "The contrast must be an interaction between one continuous "
-                    "variable and one categorical variable. Your contrast contains "
-                    f"the following variables : {contrast_elements}"
-                )
-            idx = 0 if categorical[0] else 1
-            categorical_contrast = contrast_elements[idx]
-            continue_contrast = contrast_elements[(idx + 1) % 2]
-            group_values = np.unique(df_subjects[categorical_contrast])
-            built_contrast = df_subjects[continue_contrast] * (
-                (df_subjects[categorical_contrast] == group_values[0]).astype(int)
-            ) - df_subjects[continue_contrast] * (
-                (df_subjects[categorical_contrast] == group_values[1]).astype(int)
-            )
-            contrasts[contrast] = built_contrast
-            filenames[contrast] = (
-                output_dir / f"interaction-{contrast}_measure-{feature_label}_fwhm-{fwhm}"
-            )
-    elif glm_type == "correlation":
-        built_contrast = df_subjects[absolute_contrast]
-        if contrast_sign == "negative":
-            built_contrast *= -1
-        contrasts[contrast] = built_contrast
-        filenames[contrast] = output_dir / (
-            f"group-{group_label}_correlation-{contrast}-{contrast_sign}_"
-            f"measure-{feature_label}_fwhm-{fwhm}"
-        )
-    else:
-        raise ValueError(
-            "Check out if you define the glmtype flag correctly, "
-            "or define your own general linear model, e,g MGLM."
-        )
+
+    contrasts, filenames = _get_contrasts_and_filenames(
+        glm_type, contrast, df_subjects
+    )
+    naming_parameters = {
+        "fwhm": fwhm,
+        "group_label": group_label,
+        "feature_label": feature_label,
+    }
     model = _build_model(design_matrix, df_subjects)
     for contrast_name, model_contrast in contrasts.items():
-        filename_root = filenames[contrast_name]
+        filename_root = output_dir / filenames[contrast_name].safe_substitute(
+            contrast_name=contrast_name, **naming_parameters
+        )
         slm_model = SLM(
             model,
             contrast=model_contrast,
