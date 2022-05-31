@@ -96,6 +96,36 @@ def _build_thickness_array(
     return thickness
 
 
+def _get_average_surface(fsaverage_path: PathLike) -> dict:
+    meshes = [
+        load_surf_mesh(str(fsaverage_path / Path(f"{hemi}.pial")))
+        for hemi in ['lh', 'rh']
+    ]
+    coordinates = np.vstack([mesh.coordinates for mesh in meshes])
+    faces = np.vstack([
+        meshes[0].faces,
+        meshes[1].faces + meshes[0].coordinates.shape[0]
+    ])
+    average_mesh = Mesh(
+        coordinates=coordinates,
+        faces=faces,
+    )
+    ##################
+    ## UGLY HACK !!! Need investigation
+    ##################
+    # Uncomment the following line if getting an error
+    # with negative values in bincount in Brainstat.
+    # Not sure, but might be a bug in BrainStat...
+    #
+    #faces += 1
+    #################
+    average_surface = {
+        "coord": coordinates,
+        "tri": faces,
+    }
+    return average_surface, average_mesh
+
+
 def _check_contrast(
         contrast: str,
         df_subjects: pd.DataFrame,
@@ -127,26 +157,43 @@ def _check_contrast(
     return absolute_contrast, contrast_sign, with_interaction
 
 
-def _print_clusters(slm_model, threshold):
+def _print_clusters(model, threshold: float):
     """Print results related to total number of clusters
     and significative clusters.
     """
     print("#" * 40)
     print("After correction (Clusterwise Correction for Multiple Comparisons): ")
-    df = slm_model.P['clus'][1]
+    df = model.P['clus'][1]
     print(df)
     print(f"Clusters found: {len(df)}")
     print(f"Significative clusters (after correction): {len(df[df['P'] <= threshold])}")
 
 
-def _plot_stat_map(mesh, texture, filename, threshold=None, verbose=True):
+def _plot_stat_map(mesh, texture, filename, threshold=None, title=None, verbose=True):
     from nilearn.plotting import plot_surf_stat_map
     plot_filename = filename + ".png"
     if verbose:
         print(f"--> Saving plot to {plot_filename}")
     plot_surf_stat_map(
-        mesh, texture, threshold=threshold, output_file=plot_filename
+        mesh, texture, threshold=threshold, output_file=plot_filename, title=title,
     )
+
+
+def _plot_results(results: dict, filename_root: PathLike, mesh, verbose=True):
+    for name, result in results.items():
+        if name != "coefficients":
+            if isinstance(result, dict):
+                texture = result['P']
+            else:
+                texture = result
+            _plot_stat_map(
+                mesh,
+                texture,
+                str(filename_root) + name,
+                threshold=None,
+                title=name,
+                verbose=verbose,
+            )
 
 
 def _save_to_mat(struct, filename, key, verbose=True):
@@ -326,6 +373,95 @@ def _get_correlation_contrast(
     return contrasts, filenames
 
 
+def _compute_results(
+        model,
+        mask,
+        threshold_uncorrected_pvalue,
+        threshold_corrected_pvalue
+):
+    results = dict()
+    results["coefficients"] = np.nan_to_num(model.coef)
+    results["TStatistics"] = np.nan_to_num(model.t)
+    results["uncorrectedPValue"] = dict()
+    results["uncorrectedPValue"]["P"] = 1 - t.cdf(results["TStatistics"], model.df)
+    results["uncorrectedPValue"]["mask"] = mask
+    results["uncorrectedPValue"]["thresh"] = threshold_uncorrected_pvalue
+    results["FDR"] = model._fdr()
+    results["correctedPValue"] = dict()
+    results["correctedPValue"]["P"] = model.P["pval"]["P"]
+    results["correctedPValue"]["C"] = model.P["pval"]["C"]
+    results["correctedPValue"]["mask"] = mask
+    results["correctedPValue"]["thresh"] = threshold_corrected_pvalue
+    return results
+
+
+def _save_results_to_json(results: dict, filename_root: PathLike, verbose=True):
+    import json
+    out_json_file = str(filename_root) + "_results.json"
+    if verbose:
+        print(f"--> Writing results to JSON in {out_json_file}...")
+    jsonable = dict()
+    for k, v in results.items():
+        if isinstance(v, np.ndarray):
+            jsonable[k] = v.tolist()
+        elif isinstance(v, dict):
+            jsonable[k] = dict()
+            for kk, vv in v.items():
+                if isinstance(vv, np.ndarray):
+                    jsonable[k][kk] = vv.tolist()
+                else:
+                    jsonable[k][kk] = vv
+        else:
+            jsonable[k] = v
+    with open(out_json_file, "w") as fp:
+        json.dump(jsonable, fp, indent=4)
+
+
+def _save_results_to_mat(results: dict, filename_root: PathLike, verbose=True):
+    # These labels are used for compatibility with the previous
+    # MATLAB implementation of the Statistics Surface Pipeline
+    # of Clinica.
+    if verbose:
+        print("--> Writing results to mat files...")
+    STRUCT_LABELS = {
+        "coefficients": "coef",
+        "TStatistics": "tvaluewithmask",
+        "uncorrectedPValue": "uncorrectedpvaluesstruct",
+        "correctedPValue": "correctedpvaluesstruct",
+        "FDR": "FDR",
+    }
+    for name, result in results.items():
+        _save_to_mat(
+            result,
+            str(filename_root) + "_" + name,
+            STRUCT_LABELS[name],
+            verbose=verbose,
+        )
+
+
+def _save_results_to_bids(results: dict, filename_root: PathLike, verbose=True):
+    warnings.warn("Writing results to BIDS is not implemented yet.")
+
+
+WRITERS = {
+    "json": _save_results_to_json,
+    "mat": _save_results_to_mat,
+    "bids": _save_results_to_bids,
+}
+
+
+def _save_results(results: dict, filename_root: PathLike, out_formats="all", verbose=True):
+    if out_formats == "all":
+        out_formats = list(WRITERS.keys())
+    for output_format in out_formats:
+        if output_format not in WRITERS:
+            warnings.warn(
+                f"Could not write to {output_format} because "
+                "writer doesn't exist."
+            )
+        WRITERS[output_format](results, filename_root, verbose=verbose)
+
+
 def clinica_surfstat(
     input_dir: PathLike,
     output_dir: PathLike,
@@ -393,41 +529,14 @@ def clinica_surfstat(
     if verbose:
         print(f"--> fsaverage path : {fsaverage_path}")
     df_subjects = _read_and_check_tsv_file(tsv_file)
-    n_subjects = len(df_subjects)
     thickness = _build_thickness_array(
         input_dir, surface_file, df_subjects, fwhm
     )
     mask = thickness[0, :] > 0
-    meshes = [
-        load_surf_mesh(str(fsaverage_path / Path(f"{hemi}.pial")))
-        for hemi in ['lh', 'rh']
-    ]
-    coordinates = np.vstack([mesh.coordinates for mesh in meshes])
-    faces = np.vstack([
-        meshes[0].faces,
-        meshes[1].faces + meshes[0].coordinates.shape[0]
-    ])
-    average_mesh = Mesh(
-        coordinates=coordinates,
-        faces=faces,
-    )
-    ##################
-    ## UGLY HACK !!! Need investigation
-    ##################
-    # Uncomment the following line if getting an error
-    # with negative values in bincount in Brainstat.
-    # Not sure, but might be a bug in BrainStat...
-    #
-    #faces += 1
-    #################
-    average_surface = {
-        "coord": coordinates,
-        "tri": faces,
-    }
+    average_surface, average_mesh = _get_average_surface(fsaverage_path)
     if verbose:
         print(f"--> The GLM linear model is: {design_matrix}")
         print(f"--> The GLM type is: {glm_type}")
-
     contrasts, filenames = _get_contrasts_and_filenames(
         glm_type, contrast, df_subjects
     )
@@ -453,51 +562,21 @@ def clinica_surfstat(
         if verbose:
             print(f"--> Fitting the SLM model with contrast {contrast_name}...")
         slm_model.fit(thickness)
-        model_coefficients = np.nan_to_num(slm_model.coef)
+        results = _compute_results(
+            slm_model, mask, threshold_uncorrected_pvalue, threshold_corrected_pvalue
+        )
+        _save_results(
+            results, filename_root, out_formats="all", verbose=verbose
+        )
+        _plot_results(
+            results, filename_root, average_mesh, verbose=verbose
+        )
+        _print_clusters(
+            slm_model, threshold_corrected_pvalue
+        )
+
         # beta_hat = np.linalg.pinv(model.matrix.values.T @ model.matrix.values) @ model.matrix.values.T @ thickness
         # assert_array_almost_equal(beta_hat, np.nan_to_num(slm_model.coef))
-        t_values = np.nan_to_num(slm_model.t)
-        uncorrected_p_values = 1 - t.cdf(t_values, slm_model.df)
-        structs = [
-            t_values,
-            {
-                'P': uncorrected_p_values,
-                'mask': mask,
-                'thresh': threshold_uncorrected_pvalue,
-            },
-            {
-                'P': slm_model.P['pval']['P'],
-                'C': slm_model.P['pval']['C'],
-                'mask': mask,
-                'thresh': threshold_corrected_pvalue,
-            },
-            model_coefficients,
-            slm_model._fdr(),
-        ]
-        for name, key, struct in zip(
-                ["_TStatistics", "_uncorrectedPValue", "_correctedPValue", "coefficients", "FDR"],
-                ["tvaluewithmask", "uncorrectedpvaluesstruct", "correctedpvaluesstruct", "to_save", "FDR"],
-                structs,
-        ):
-            if isinstance(struct, dict):
-                texture = struct['P']
-            else:
-                texture = struct
-            if name != "coefficients":
-                _plot_stat_map(
-                    average_mesh,
-                    texture,
-                    str(filename_root) + name,
-                    threshold=None,
-                    verbose=verbose,
-                )
-            _save_to_mat(
-                struct,
-                str(filename_root) + name,
-                key,
-                verbose=verbose,
-            )
-        _print_clusters(slm_model, threshold_corrected_pvalue)
 
 if __name__ == "__main__":
     current_dir = Path(
