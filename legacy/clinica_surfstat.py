@@ -70,12 +70,12 @@ def _get_t1_freesurfer_custom_file_template(base_dir):
 def _build_thickness_array(
         input_dir: PathLike,
         surface_file: Template,
-        df_subjects: pd.DataFrame,
+        df: pd.DataFrame,
         fwhm: float,
 ) -> np.ndarray:
     from nibabel.freesurfer.mghformat import load
     thickness = []
-    for idx, row in df_subjects.iterrows():
+    for idx, row in df.iterrows():
         subject = row[TSV_FIRST_COLUMN]
         session = row[TSV_SECOND_COLUMN]
         parts = (
@@ -88,15 +88,15 @@ def _build_thickness_array(
         combined = np.vstack(parts)
         thickness.append(combined.flatten())
     thickness = np.vstack(thickness)
-    if thickness.shape[0] != len(df_subjects):
+    if thickness.shape[0] != len(df):
         raise ValueError(
             f"Unexpected shape for thickness array : {thickness.shape}. "
-            f"Expected {len(df_subjects)} rows."
+            f"Expected {len(df)} rows."
         )
     return thickness
 
 
-def _get_average_surface(fsaverage_path: PathLike) -> dict:
+def _get_average_surface(fsaverage_path: PathLike) -> Tuple[dict, Mesh]:
     meshes = [
         load_surf_mesh(str(fsaverage_path / Path(f"{hemi}.pial")))
         for hemi in ['lh', 'rh']
@@ -128,7 +128,7 @@ def _get_average_surface(fsaverage_path: PathLike) -> dict:
 
 def _check_contrast(
         contrast: str,
-        df_subjects: pd.DataFrame,
+        df: pd.DataFrame,
         glm_type: str,
 ) -> Tuple[str, str, bool]:
     absolute_contrast = contrast
@@ -144,12 +144,12 @@ def _check_contrast(
             "please carefully check the format of your tsv files."
         )
     else:
-        if absolute_contrast not in df_subjects.columns:
+        if absolute_contrast not in df.columns:
             raise ValueError(
                 f"Column {absolute_contrast} does not exist in provided TSV file."
             )
         if glm_type == "group_comparison":
-            unique_labels = np.unique(df_subjects[absolute_contrast])
+            unique_labels = np.unique(df[absolute_contrast])
             if len(unique_labels) != 2:
                 raise ValueError(
                     "For group comparison, there should be just 2 different groups!"
@@ -198,20 +198,10 @@ def _plot_results(results: dict, filename_root: PathLike, mesh, verbose=True):
 
 def _save_to_mat(struct, filename, key, verbose=True):
     from scipy.io import savemat
-    #masked_texture = texture
-    #mask_ = np.ones_like(texture)
-    #if mask is not None:
-    #    mask_ = mask
-    #if threshold is None:
-    #    threshold = 0.0
-    #masked_texture = texture * mask_
     mat_filename = filename + ".mat"
     if verbose:
         print(f"--> Saving matrix to {mat_filename}")
-    savemat(
-        mat_filename,
-        {key: struct},
-    )
+    savemat(mat_filename, {key: struct})
 
 
 def _build_model(design_matrix: str, df: pd.DataFrame):
